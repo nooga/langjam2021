@@ -44,7 +44,7 @@ const lexerRules = {
             let newlines;
             if ((newlines = match.match(/\n/g))) {
                 state.ws = true;
-                state.line += newlines;
+                state.line += newlines.length;
                 state.column = match.length - match.lastIndexOf("\n");
             }
         },
@@ -254,6 +254,7 @@ const lexer = (rules) => (input) => {
         },
         next() {
             this.cur = this.gen.next();
+            //console.log(this.cur);
             if (this.cur.error) throw this.cur.error;
         },
     };
@@ -292,12 +293,32 @@ const isTerminator = (t) => {
     );
 };
 
+const astComments = (ast, c) => {
+    if (!c || c.length == 0) return ast;
+    if (!ast.comments) ast.comments = [];
+    if (Array.isArray(c)) ast.comments = ast.comments.concat(c);
+    else ast.comments.push(c);
+    return ast;
+};
+
+const eatComments = (ctx, all) => {
+    const { tok } = ctx;
+    const comments = [];
+    while (true) {
+        if (tok.peek().kind == Tok.CMT || tok.peek().kind == Tok.LCMT) {
+            if (!all && tok.peek().pos.precNL) break;
+            comments.push(tok.peek().value);
+            tok.accept(tok.peek().kind);
+        } else break;
+    }
+    return comments;
+};
+
 const parseExpr = (ctx, minPrec) => {
     const { optable, tok } = ctx;
-    let ret = parseAtom(ctx);
+    let ret = parseAtom(ctx); // eats comments
     while (true) {
         const cur = tok.peek();
-        //if (cur.kind != Tok.OP || optable[cur.value].prec < minPrec) break;
         let op = null;
         if (cur.kind == Tok.OP) {
             if (optable[cur.value].prec < minPrec) break;
@@ -310,6 +331,8 @@ const parseExpr = (ctx, minPrec) => {
             if (optable[op].prec < minPrec) break;
         }
 
+        let comments = eatComments(ctx);
+
         const { prec, assoc } = optable[op];
         let rhs = parseExpr(ctx, assoc == Assoc.LEFT ? prec + 1 : prec);
         ret = {
@@ -318,6 +341,7 @@ const parseExpr = (ctx, minPrec) => {
             lhs: ret,
             rhs: rhs,
         };
+        if (comments.length > 0) astComments(ret, comments);
     }
     return ret;
 };
@@ -326,11 +350,20 @@ const parseDo = (ctx) => {
     const { tok } = ctx;
     const ret = { t: "do", exprs: [] };
     tok.accept(Tok.DO);
+    let postDoComments = eatComments(ctx);
     tok.accept(Tok.LCURL);
+    let postOpenComments = eatComments(ctx);
+    let exprsComments = [];
     while (tok.peek().kind != Tok.RCURL) {
-        ret.exprs.push(parseExpr(ctx, 1));
+        let preExp = eatComments(ctx);
+        exprsComments = exprsComments.concat(preExp);
+        let expr = parseExpr(ctx, 1);
+        if (expr.comments) exprsComments = exprsComments.concat(expr.comments);
+        astComments(expr, preExp);
+        ret.exprs.push(expr);
         if (tok.peek().kind != Tok.RCURL) tok.accept(Tok.SEMICOLON);
     }
+    let preCloseComments = eatComments(ctx);
     if (tok.peek().kind == Tok.RCURL) tok.accept(Tok.RCURL);
     else
         throw new Error(
@@ -338,7 +371,11 @@ const parseDo = (ctx) => {
                 tok.peek().pos
             )} to close \`}\` from ${sourcePos(start.pos)}`
         );
-
+    let allComments = postDoComments
+        .concat(postOpenComments)
+        .concat(exprsComments)
+        .concat(preCloseComments);
+    astComments(ret, allComments);
     return ret;
 };
 
@@ -346,19 +383,27 @@ const parseIf = (ctx) => {
     const { tok } = ctx;
     const ret = { t: "if", cond: null, then: null, els: { t: "nil" } };
     tok.accept(Tok.IF);
-    ret.cond = parseExpr(ctx, 1);
+    let postIfComments = eatComments(ctx);
+    ret.cond = astComments(parseExpr(ctx, 1), postIfComments);
     tok.accept(Tok.THEN);
-    ret.then = parseExpr(ctx, 1);
+    let postThenComments = eatComments(ctx);
+    ret.then = astComments(parseExpr(ctx, 1), postThenComments);
+    let postElseComments = [];
     if (tok.peek().kind == Tok.ELSE) {
         tok.accept(Tok.ELSE);
-        ret.els = parseExpr(ctx, 1);
+        postElseComments = eatComments(ctx);
+        ret.els = astComments(parseExpr(ctx, 1), postElseComments);
     }
+    let allComments = postIfComments
+        .concat(postThenComments)
+        .concat(postElseComments);
     return ret;
 };
 
 const parseArg = (ctx) => {
     const { tok } = ctx;
     const cur = tok.peek();
+    eatComments(ctx);
     switch (cur.kind) {
         case Tok.ID:
             tok.accept(Tok.ID);
@@ -367,7 +412,7 @@ const parseArg = (ctx) => {
             throw new Error(
                 `SyntaxError: Expected formal argument at ${sourcePos(
                     tok.peek().pos
-                )} but got this instead: ☞${input.substr(0, 20)}...`
+                )} but got this instead:\n${tok.report()}`
             );
     }
 };
@@ -379,6 +424,7 @@ const parseEquation = (ctx) => {
         lhs: { t: "pattern", name: null, args: [] },
         rhs: null,
     };
+    eatComments(ctx);
     if (tok.peek().kind != Tok.ID) {
         if (tok.peek().kind == Tok.LPAR) {
             tok.accept(Tok.LPAR);
@@ -388,7 +434,7 @@ const parseEquation = (ctx) => {
                         tok.peek().pos
                     )} but got this instead:\n${tok.report()}`
                 );
-            console.log(tok.peek());
+            //console.log(tok.peek());
             ret.lhs.name = tok.peek().value;
             tok.accept(Tok.OP);
             tok.accept(Tok.RPAR);
@@ -402,11 +448,14 @@ const parseEquation = (ctx) => {
         ret.lhs.name = tok.peek().value;
         tok.accept(Tok.ID);
     }
+    eatComments(ctx);
     while (tok.peek().kind != Tok.EQUALS) {
         ret.lhs.args.push(parseArg(ctx));
     }
+
     tok.accept(Tok.EQUALS);
-    ret.rhs = parseExpr(ctx, 1);
+    let exprComments = eatComments(ctx);
+    ret.rhs = astComments(parseExpr(ctx, 1), exprComments);
     return ret;
 };
 
@@ -414,6 +463,7 @@ const parseEquation = (ctx) => {
 const parseOpDef = (ctx) => {
     const { optable, tok } = ctx;
     tok.accept(Tok.OPERATOR);
+    eatComments(ctx);
     if (tok.peek().kind != Tok.OP)
         throw new Error(
             `SyntaxError: Expected operator at ${sourcePos(
@@ -423,6 +473,7 @@ const parseOpDef = (ctx) => {
 
     const op = tok.peek().value;
     tok.accept(Tok.OP);
+    eatComments(ctx);
     if (tok.peek().kind != Tok.NUM)
         throw new Error(
             `SyntaxError: Expected a number (operator precedence) at ${sourcePos(
@@ -440,6 +491,7 @@ const parseOpDef = (ctx) => {
 
     tok.accept(Tok.NUM);
     let assoc = null;
+    eatComments(ctx);
     if (tok.peek().kind == Tok.LEFT) {
         assoc = Assoc.LEFT;
         tok.accept(Tok.LEFT);
@@ -452,7 +504,7 @@ const parseOpDef = (ctx) => {
                 tok.peek().pos
             )} but got this:\n${tok.report()}`
         );
-
+    eatComments(ctx);
     optable[op] = { prec, assoc };
     return { t: "void" }; // not sure if good idea
 };
@@ -463,17 +515,11 @@ const parseDef = (ctx) => {
     return parseEquation(ctx);
 };
 
-const astComment = (ast, c) => {
-    if (!ast.comments) ast.comments = [];
-    ast.comments.push(c);
-    return ast;
-};
-
 const parseAtom = (ctx) => {
     const { tok } = ctx;
     const atom = parseAtomRaw(ctx);
     if (tok.peek().kind == Tok.CMT || tok.peek().kind == Tok.LCMT) {
-        astComment(atom, tok.peek().value);
+        astComments(atom, tok.peek().value);
         tok.accept(tok.peek().kind);
     }
     return atom;
@@ -545,9 +591,11 @@ const parseAtomRaw = (ctx) => {
 
 const parseForm = (ctx) => {
     const { tok } = ctx;
+    let comments = eatComments(ctx, true);
     const cur = tok.peek();
     if (cur.kind == Tok.EOF) return { t: "void" };
     let ret = null;
+
     switch (cur.kind) {
         case Tok.OPERATOR:
             ret = parseOpDef(ctx);
@@ -559,7 +607,8 @@ const parseForm = (ctx) => {
             ret = parseExpr(ctx, 1);
     }
     tok.accept(Tok.SEMICOLON);
-    return ret;
+    comments = comments.concat(eatComments(ctx));
+    return astComments(ret, comments);
 };
 
 const parseProgram = (ctx) => {
@@ -581,7 +630,7 @@ const debugAST = (ast, indent = 0) => {
     if (!ast) return "<failed parse>";
     let p = "";
     for (let i = 0; i < indent; i++) p += " ";
-    p += ast.t + ": ";
+    p += ast.t + " " + ast.comments + ": ";
     switch (ast.t) {
         case "num":
         case "string":
@@ -721,10 +770,7 @@ const compile = (ctx, ast) => {
             if (op == "APPLY" || op == "$")
                 return wrapComment(
                     ast,
-                    `(${compile(ctx, ast.lhs)}).valueOf()(${compile(
-                        ctx,
-                        ast.rhs
-                    )})`
+                    `RT.V(${compile(ctx, ast.lhs)})(${compile(ctx, ast.rhs)})`
                 );
 
             if (isJSOp(ctx, op)) {
@@ -753,7 +799,7 @@ const compile = (ctx, ast) => {
 
             return wrapComment(
                 ast,
-                `${munge(op)}.valueOf()(${compile(ctx, ast.lhs)})(${compile(
+                `RT.V(${munge(op)})(${compile(ctx, ast.lhs)})(${compile(
                     ctx,
                     ast.rhs
                 )})`
@@ -831,6 +877,10 @@ const RT = {
     E(v) {
         return v instanceof Cell ? v.comments() : [];
     },
+    V(v) {
+        if (v instanceof Cell) return v.valueOf();
+        else return v;
+    },
     println(x) {
         console.log(x);
         return x;
@@ -843,43 +893,22 @@ const RT = {
     },
 };
 
-//////// prelude
-
-///////
-
-const fib = `
-def zero? n = n == 0;
-def one? n = n == 1;
-def addOne = RT.WC (+ 1) 999;
-op <+> 20 left;
-def (<+>) a b = 2 * a + b;
-def y = RT.WC 3 666;
-def x = y <+> 1 * 2;
-def fib n = if zero? n
-            then 0
-            else if one? n
-                then 1
-                else fib (n - 1) + fib (n - 2);
-
-fib $ addOne $ addOne x;
-RT.map (.length) (RT.E y) ;
-`;
-
-const oprec = `
-    boo.a.b + zoo.c.d ; 
-    foo 5 6 + boo 7 8 ;
-`;
-
-let inputFile = process.argv[2] || "examples/fib.js";
+let inputFile = process.argv[2] || "examples/hello.js";
 let input = fs.readFileSync(inputFile, { encoding: "utf-8" });
 
 const tokens = lexer(lexerRules)(input);
 const context = { optable: ops, tok: tokens };
 const parsed = parseProgram(context, 1);
 //console.log(util.inspect(parsed, { depth: Infinity, colors: true }));
-console.log("--input:\n", input);
-console.log("--parsed:\n", debugAST(parsed));
+//console.log("--input:\n", input);
+//console.log("--parsed:\n", debugAST(parsed));
 const compiled = prettier.format(compile(context, parsed), { parser: "babel" });
-console.log("--compiled:\n", compiled);
-const foo = 10;
-console.log("--result:\n", eval(compiled));
+//console.log("--compiled:\n", compiled);
+console.log(
+    "\n\nreturned value:\n" +
+        util.inspect(eval(compiled).valueOf(), {
+            colors: true,
+            depth: Infinity,
+        })
+);
+//console.log("input file", inputFile);
