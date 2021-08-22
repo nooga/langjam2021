@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+yarn install || npm install
+node index.js examples/fib.iv

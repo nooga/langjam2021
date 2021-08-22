@@ -1,0 +1,15 @@
+def zero? n = n == 0;
+def one? n = n == 1;
+def addOne = RT.WC (+ 1) 999;
+op <+> 20 left;
+def (<+>) a b = 2 * a + b;
+def y = 3 /* haha comment */;
+def x = y <+> 1 * 2;
+def fib n = if zero? n
+            then 0
+            else if one? n
+                then 1
+                else fib (n - 1) + fib (n - 2);
+
+fib $ addOne $ addOne x;
+RT.map (."length") $ RT.E y;
