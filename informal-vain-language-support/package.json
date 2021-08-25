@@ -1,0 +1,25 @@
+{
+    "name": "informal-vain-language-support",
+    "displayName": "informal vain language support",
+    "description": "Adds syntax highlighting for informal vain",
+    "version": "0.0.1",
+    "engines": {
+        "vscode": "^1.59.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "contributes": {
+        "languages": [{
+            "id": "informalvain",
+            "aliases": ["informal vain", "informalvain"],
+            "extensions": [".iv"],
+            "configuration": "./language-configuration.json"
+        }],
+        "grammars": [{
+            "language": "informalvain",
+            "scopeName": "source.informalvain",
+            "path": "./syntaxes/informalvain.tmLanguage.json"
+        }]
+    }
+}

@@ -1,0 +1,69 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "informal vain",
+    "patterns": [
+        {
+            "include": "#keywords"
+        },
+        {
+            "include": "#strings"
+        },
+        {
+            "include": "#comments"
+        },
+        { "include": "#variables" },
+        { "include": "#constants" }
+    ],
+    "repository": {
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.informalvain",
+                    "match": "\\b(let|def|do|if|then|else|left|right|op|in)\\b"
+                }
+            ]
+        },
+        "strings": {
+            "name": "string.quoted.double.informalvain",
+            "begin": "\"",
+            "end": "\"",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.informalvain",
+                    "match": "\\\\."
+                }
+            ]
+        },
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.informalvain",
+                    "begin": "//",
+                    "end": "\n"
+                },
+                {
+                    "name": "comment.block.informalvain",
+                    "begin": "/\\*",
+                    "end": "\\*/"
+                }
+            ]
+        },
+        "variables": {
+            "patterns": [
+                {
+                    "name": "variable.language.informalvain",
+                    "match": "\\b[A-Za-z][A-Za-z0-9_?!'-]*\\b"
+                }
+            ]
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "constant.numeric",
+                    "match": "[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?"
+                }
+            ]
+        }
+    },
+    "scopeName": "source.informalvain"
+}
