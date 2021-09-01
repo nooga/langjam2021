@@ -1,11 +1,14 @@
 const util = require("util");
+const arg = require("arg");
 const prettier = require("prettier");
 const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
 
 const fnil = (x, d) => x || d;
 
 const sourcePos = ({ source, line, column }) =>
-    `(${source || "input"} ${line}:${column})`;
+    `(${source || "input"} ${line + 1}:${column + 1})`;
 
 const Tok = Object.freeze({
     NUM: Symbol("TokNum"),
@@ -14,6 +17,8 @@ const Tok = Object.freeze({
     LET: Symbol("TokLet"),
     DO: Symbol("TokDo"),
     IF: Symbol("TokIf"),
+    IN: Symbol("TokIn"),
+    PIPE: Symbol("TokPipe"),
     THEN: Symbol("TokThen"),
     ELSE: Symbol("TokElse"),
     FN: Symbol("TokFn"),
@@ -27,8 +32,11 @@ const Tok = Object.freeze({
     RPAR: Symbol("TokRParen"),
     LCURL: Symbol("TokLCurl"),
     RCURL: Symbol("TokRCurl"),
+    LSQR: Symbol("TokLSqr"),
+    RSQR: Symbol("TokRSqr"),
     OP: Symbol("TokOp"),
     COMMA: Symbol("TokComma"),
+    COLON: Symbol("TokColon"),
     ARROW: Symbol("TokArrow"),
     EQUALS: Symbol("TokEquals"),
     SEMICOLON: Symbol("TokSemicolon"),
@@ -57,6 +65,7 @@ const lexerRules = {
         match: /^[A-Za-z]+[A-Za-z0-9_?!'-]*/,
         classify: {
             let: Tok.LET,
+            in: Tok.IN,
             do: Tok.DO,
             if: Tok.IF,
             then: Tok.THEN,
@@ -72,10 +81,12 @@ const lexerRules = {
         match: /^\/\*/,
         until: /^\*\//,
         vmap: (c) => c.trim(),
+        ignore: true,
     },
     [Tok.LCMT]: {
         match: /^\/\/.*$/m,
         vmap: (c) => c.trim(),
+        ignore: true,
     },
     [Tok.LPAR]: {
         match: /^\(/,
@@ -89,21 +100,31 @@ const lexerRules = {
     [Tok.RCURL]: {
         match: /^\}/,
     },
+    [Tok.LSQR]: {
+        match: /^\[/,
+    },
+    [Tok.RSQR]: {
+        match: /^\]/,
+    },
     [Tok.COMMA]: {
         match: /^,/,
     },
     [Tok.SEMICOLON]: {
-        match: /^\;/,
+        match: /^\;+/,
+    },
+    [Tok.COLON]: {
+        match: /^:/,
     },
     [Tok.STRING]: {
-        match: /^"(?:\\"|[^"])+"/,
+        match: /^"(?:\\"|[^"])*"/,
         vmap: (s) => JSON.parse(s),
     },
     [Tok.OP]: {
-        match: /^[`~!@#$%^&*_+=:<>./?-]+/,
+        match: /^[`~!@#$%^&*_+=:<>./?|-]+/,
         classify: {
             "=": Tok.EQUALS,
             "=>": Tok.ARROW,
+            "|": Tok.PIPE,
         },
     },
 };
@@ -193,9 +214,9 @@ const lexer = (rules) => (input) => {
             }
             return new Error(
                 `Unexpected input at ${sourcePos({
-                    offset,
-                    column,
-                    line,
+                    offset: state.offset,
+                    column: state.column,
+                    line: state.line,
                 })}: ☞${input.substr(0, 20)}...`
             );
         }
@@ -217,6 +238,12 @@ const lexer = (rules) => (input) => {
         cur: gen.next(),
         peek() {
             return this.cur.value;
+        },
+        is(t) {
+            return this.peek().kind == t;
+        },
+        isNot(t) {
+            return !this.is(t);
         },
         report(n = 40) {
             const { offset } = this.peek().pos;
@@ -267,6 +294,7 @@ const Assoc = Object.freeze({
 
 const ops = {
     $: { prec: 1, assoc: Assoc.RIGHT },
+    "|>": { prec: 1, assoc: Assoc.LEFT },
     "+": { prec: 20, assoc: Assoc.LEFT, js: true },
     "-": { prec: 20, assoc: Assoc.LEFT, js: true },
     "*": { prec: 30, assoc: Assoc.LEFT, js: true },
@@ -278,6 +306,10 @@ const ops = {
     "<": { prec: 16, assoc: Assoc.LEFT, js: true },
     ">=": { prec: 16, assoc: Assoc.LEFT, js: true },
     "<=": { prec: 16, assoc: Assoc.LEFT, js: true },
+    "==": { prec: 17, assoc: Assoc.LEFT, js: true },
+    "!=": { prec: 17, assoc: Assoc.LEFT, js: true },
+    "||": { prec: 18, assoc: Assoc.LEFT, js: true },
+    "@": { prec: 1000, assoc: Assoc.RIGHT },
     APPLY: { prec: 1000, assoc: Assoc.LEFT },
     ".": { prec: 2000, assoc: Assoc.LEFT, js: true },
 };
@@ -286,10 +318,17 @@ const isTerminator = (t) => {
     return (
         t.kind == Tok.RPAR ||
         t.kind == Tok.RCURL ||
+        t.kind == Tok.RSQR ||
         t.kind == Tok.SEMICOLON ||
+        t.kind == Tok.COMMA ||
+        t.kind == Tok.COLON ||
         t.kind == Tok.THEN ||
         t.kind == Tok.ELSE ||
-        t.kind == Tok.EOF
+        t.kind == Tok.EOF ||
+        t.kind == Tok.IN ||
+        t.kind == Tok.PIPE ||
+        t.kind == Tok.EQUALS ||
+        t.pos.precNL
     );
 };
 
@@ -305,7 +344,7 @@ const eatComments = (ctx, all) => {
     const { tok } = ctx;
     const comments = [];
     while (true) {
-        if (tok.peek().kind == Tok.CMT || tok.peek().kind == Tok.LCMT) {
+        if (tok.is(Tok.CMT) || tok.is(Tok.LCMT)) {
             if (!all && tok.peek().pos.precNL) break;
             comments.push(tok.peek().value);
             tok.accept(tok.peek().kind);
@@ -319,12 +358,14 @@ const parseExpr = (ctx, minPrec) => {
     let ret = parseAtom(ctx); // eats comments
     while (true) {
         const cur = tok.peek();
+        //console.log(cur, isTerminator(cur));
         let op = null;
         if (cur.kind == Tok.OP) {
             if (optable[cur.value].prec < minPrec) break;
             op = cur.value;
             tok.accept(Tok.OP);
         } else if (isTerminator(cur)) {
+            //console.log("D");
             break;
         } else {
             op = "APPLY";
@@ -354,17 +395,19 @@ const parseDo = (ctx) => {
     tok.accept(Tok.LCURL);
     let postOpenComments = eatComments(ctx);
     let exprsComments = [];
-    while (tok.peek().kind != Tok.RCURL) {
+    while (tok.isNot(Tok.RCURL)) {
         let preExp = eatComments(ctx);
         exprsComments = exprsComments.concat(preExp);
         let expr = parseExpr(ctx, 1);
         if (expr.comments) exprsComments = exprsComments.concat(expr.comments);
         astComments(expr, preExp);
         ret.exprs.push(expr);
-        if (tok.peek().kind != Tok.RCURL) tok.accept(Tok.SEMICOLON);
+        if (tok.isNot(Tok.RCURL)) {
+            if (tok.is(Tok.SEMICOLON)) tok.accept(Tok.SEMICOLON);
+        } else break;
     }
     let preCloseComments = eatComments(ctx);
-    if (tok.peek().kind == Tok.RCURL) tok.accept(Tok.RCURL);
+    if (tok.is(Tok.RCURL)) tok.accept(Tok.RCURL);
     else
         throw new Error(
             `SyntaxError: Expected \`}\` at ${sourcePos(
@@ -379,6 +422,21 @@ const parseDo = (ctx) => {
     return ret;
 };
 
+const parseLet = (ctx) => {
+    const { tok } = ctx;
+    const ret = { t: "let", eqns: [], exp: null };
+    tok.accept(Tok.LET);
+    while (tok.isNot(Tok.IN)) {
+        ret.eqns.push(parseEquation(ctx));
+        if (tok.isNot(Tok.IN)) {
+            if (tok.is(Tok.SEMICOLON)) tok.accept(Tok.SEMICOLON);
+        } else break;
+    }
+    tok.accept(Tok.IN);
+    ret.exp = parseExpr(ctx, 1);
+    return ret;
+};
+
 const parseIf = (ctx) => {
     const { tok } = ctx;
     const ret = { t: "if", cond: null, then: null, els: { t: "nil" } };
@@ -389,7 +447,7 @@ const parseIf = (ctx) => {
     let postThenComments = eatComments(ctx);
     ret.then = astComments(parseExpr(ctx, 1), postThenComments);
     let postElseComments = [];
-    if (tok.peek().kind == Tok.ELSE) {
+    if (tok.is(Tok.ELSE)) {
         tok.accept(Tok.ELSE);
         postElseComments = eatComments(ctx);
         ret.els = astComments(parseExpr(ctx, 1), postElseComments);
@@ -425,10 +483,10 @@ const parseEquation = (ctx) => {
         rhs: null,
     };
     eatComments(ctx);
-    if (tok.peek().kind != Tok.ID) {
-        if (tok.peek().kind == Tok.LPAR) {
+    if (tok.isNot(Tok.ID)) {
+        if (tok.is(Tok.LPAR)) {
             tok.accept(Tok.LPAR);
-            if (tok.peek().kind != Tok.OP)
+            if (tok.isNot(Tok.OP))
                 throw new Error(
                     `SyntaxError: Expected operator at ${sourcePos(
                         tok.peek().pos
@@ -449,13 +507,41 @@ const parseEquation = (ctx) => {
         tok.accept(Tok.ID);
     }
     eatComments(ctx);
-    while (tok.peek().kind != Tok.EQUALS) {
+    while (tok.isNot(Tok.EQUALS) && tok.isNot(Tok.PIPE)) {
         ret.lhs.args.push(parseArg(ctx));
     }
 
-    tok.accept(Tok.EQUALS);
-    let exprComments = eatComments(ctx);
-    ret.rhs = astComments(parseExpr(ctx, 1), exprComments);
+    if (tok.is(Tok.PIPE)) {
+        let options = [];
+        tok.accept(Tok.PIPE);
+        let els = null;
+        while (true) {
+            let cond = null;
+            if (tok.is(Tok.ELSE)) tok.accept(Tok.ELSE);
+            else cond = parseExpr(ctx, 1);
+            tok.accept(Tok.EQUALS);
+            const expr = parseExpr(ctx, 1);
+            if (!cond) els = expr;
+            else options.push({ cond, expr });
+            if (tok.isNot(Tok.PIPE)) {
+                break;
+            }
+            tok.accept(Tok.PIPE);
+        }
+
+        ret.rhs = els || { t: "nil" };
+        for (let i = options.length - 1; i >= 0; i--)
+            ret.rhs = {
+                t: "if",
+                cond: options[i].cond,
+                then: options[i].expr,
+                els: ret.rhs,
+            };
+    } else {
+        tok.accept(Tok.EQUALS);
+        let exprComments = eatComments(ctx);
+        ret.rhs = astComments(parseExpr(ctx, 1), exprComments);
+    }
     return ret;
 };
 
@@ -464,7 +550,7 @@ const parseOpDef = (ctx) => {
     const { optable, tok } = ctx;
     tok.accept(Tok.OPERATOR);
     eatComments(ctx);
-    if (tok.peek().kind != Tok.OP)
+    if (tok.isNot(Tok.OP))
         throw new Error(
             `SyntaxError: Expected operator at ${sourcePos(
                 tok.peek().pos
@@ -474,7 +560,7 @@ const parseOpDef = (ctx) => {
     const op = tok.peek().value;
     tok.accept(Tok.OP);
     eatComments(ctx);
-    if (tok.peek().kind != Tok.NUM)
+    if (tok.isNot(Tok.NUM))
         throw new Error(
             `SyntaxError: Expected a number (operator precedence) at ${sourcePos(
                 tok.peek().pos
@@ -492,10 +578,10 @@ const parseOpDef = (ctx) => {
     tok.accept(Tok.NUM);
     let assoc = null;
     eatComments(ctx);
-    if (tok.peek().kind == Tok.LEFT) {
+    if (tok.is(Tok.LEFT)) {
         assoc = Assoc.LEFT;
         tok.accept(Tok.LEFT);
-    } else if (tok.peek().kind == Tok.RIGHT) {
+    } else if (tok.is(Tok.RIGHT)) {
         assoc = Assoc.RIGHT;
         tok.accept(Tok.RIGHT);
     } else
@@ -518,11 +604,38 @@ const parseDef = (ctx) => {
 const parseAtom = (ctx) => {
     const { tok } = ctx;
     const atom = parseAtomRaw(ctx);
-    if (tok.peek().kind == Tok.CMT || tok.peek().kind == Tok.LCMT) {
+    if (
+        atom.t == "id" ||
+        atom.t == "vec" ||
+        atom.t == "map" ||
+        atom.t == "nil"
+    ) {
+        if (tok.is(Tok.ARROW)) {
+            tok.accept(Tok.ARROW);
+            return { t: "lambda", arg: atom, body: parseExpr(ctx, 1) };
+        }
+    }
+    if (tok.is(Tok.CMT) || tok.is(Tok.LCMT)) {
         astComments(atom, tok.peek().value);
         tok.accept(tok.peek().kind);
     }
     return atom;
+};
+
+const parseMapKey = (ctx) => {
+    const { tok } = ctx;
+    switch (tok.peek().kind) {
+        case Tok.ID:
+        case Tok.STRING:
+        case Tok.NUM:
+            return parseAtomRaw(ctx);
+        default:
+            throw new Error(
+                `SyntaxError: Expected map key at ${sourcePos(
+                    tok.peek().pos
+                )} but got this:\n${tok.report()}`
+            );
+    }
 };
 
 const parseAtomRaw = (ctx) => {
@@ -543,17 +656,19 @@ const parseAtomRaw = (ctx) => {
             return parseDo(ctx);
         case Tok.IF:
             return parseIf(ctx);
-        case Tok.LPAR:
+        case Tok.LET:
+            return parseLet(ctx);
+        case Tok.LPAR: {
             let start = tok.accept(Tok.LPAR);
-            if (tok.peek().kind == Tok.RPAR) {
+            if (tok.is(Tok.RPAR)) {
                 tok.accept(Tok.RPAR);
                 return { t: "nil" };
             }
-            if (tok.peek().kind == Tok.OP) {
+            if (tok.is(Tok.OP)) {
                 const op = tok.peek();
                 tok.accept(Tok.OP);
                 const opd = optable[op.value];
-                if (tok.peek().kind == Tok.RPAR) {
+                if (tok.is(Tok.RPAR)) {
                     tok.accept(Tok.RPAR);
                     return { t: "op", op: op.value };
                 } else {
@@ -571,7 +686,7 @@ const parseAtomRaw = (ctx) => {
                 }
             }
             ret = parseExpr(ctx, 1);
-            if (tok.peek().kind == Tok.RPAR) tok.accept(Tok.RPAR);
+            if (tok.is(Tok.RPAR)) tok.accept(Tok.RPAR);
             else
                 throw new Error(
                     `SyntaxError: Expected \`)\` at ${sourcePos(
@@ -580,6 +695,61 @@ const parseAtomRaw = (ctx) => {
                 );
 
             return ret;
+        }
+        case Tok.LSQR: {
+            let ret = { t: "vec", vals: [] };
+            let start = tok.accept(Tok.LSQR);
+            if (tok.is(Tok.RSQR)) {
+                tok.accept(Tok.RSQR);
+                return ret;
+            }
+            while (true) {
+                ret.vals.push(parseExpr(ctx, 1));
+                if (tok.is(Tok.COMMA)) tok.accept(Tok.COMMA);
+                if (tok.is(Tok.RSQR)) {
+                    break;
+                }
+            }
+            if (tok.is(Tok.RSQR)) tok.accept(Tok.RSQR);
+            else
+                throw new Error(
+                    `SyntaxError: Expected \`]\` at ${sourcePos(
+                        tok.peek().pos
+                    )} to close \`[\` from ${sourcePos(start.pos)}`
+                );
+
+            return ret;
+        }
+        case Tok.LCURL: {
+            let ret = { t: "map", pairs: [] };
+            let start = tok.accept(Tok.LCURL);
+            if (tok.is(Tok.RCURL)) {
+                tok.accept(Tok.RCURL);
+                return ret;
+            }
+            while (true) {
+                let key = parseMapKey(ctx);
+                let val = null;
+                if (tok.is(Tok.COLON)) {
+                    tok.accept(Tok.COLON);
+                    val = parseExpr(ctx, 1);
+                }
+                ret.pairs.push([key, val]);
+                if (tok.is(Tok.COMMA)) tok.accept(Tok.COMMA);
+                if (tok.is(Tok.RCURL)) {
+                    break;
+                }
+            }
+            if (tok.is(Tok.RCURL)) tok.accept(Tok.RCURL);
+            else
+                throw new Error(
+                    `SyntaxError: Expected \`}\` at ${sourcePos(
+                        tok.peek().pos
+                    )} to close \`{\` from ${sourcePos(start.pos)}`
+                );
+
+            return ret;
+        }
         default:
             throw new Error(
                 `SyntaxError: Expected either number, identifier, \`(\` or \`do\` at ${sourcePos(
@@ -606,7 +776,9 @@ const parseForm = (ctx) => {
         default:
             ret = parseExpr(ctx, 1);
     }
-    tok.accept(Tok.SEMICOLON);
+    if (!tok.is(Tok.EOF)) {
+        if (tok.is(Tok.SEMICOLON)) tok.accept(Tok.SEMICOLON);
+    }
     comments = comments.concat(eatComments(ctx));
     return astComments(ret, comments);
 };
@@ -615,13 +787,13 @@ const parseProgram = (ctx) => {
     const { tok } = ctx;
     const ret = { t: "program", forms: [] };
     try {
-        while (tok.peek().kind != Tok.EOF) {
+        while (tok.isNot(Tok.EOF)) {
             const r = parseForm(ctx);
             if (r.t != "void") ret.forms.push(r);
         }
         return ret;
     } catch (e) {
-        console.log(e);
+        //console.log(e);
         return null;
     }
 };
@@ -648,6 +820,15 @@ const debugAST = (ast, indent = 0) => {
         case "do":
             p += "\n";
             for (let e of ast.exprs) p += debugAST(e, indent + 1);
+            break;
+        case "let":
+            p += "\n";
+            for (let e of ast.eqns) p += debugAST(e, indent + 1);
+            p += debugAST(ast.exp);
+            break;
+        case "vec":
+            p += "\n";
+            for (let e of ast.vals) p += debugAST(e, indent + 1);
             break;
         case "program":
             p += "\n";
@@ -678,7 +859,7 @@ const debugAST = (ast, indent = 0) => {
 };
 
 const munge = (s) => {
-    return s.replace(/[`~!@#%^&*_+=:<>./?-]/g, (s) => {
+    return s.replace(/[`~!@#%^&*_+=:<>./?|-]/g, (s) => {
         return {
             "`": "_BT_",
             "~": "_TD_",
@@ -698,6 +879,7 @@ const munge = (s) => {
             "?": "_QM_",
             "-": "_DH_",
             "+": "_PS_",
+            "|": "_PI_",
         }[s];
     });
 };
@@ -734,7 +916,20 @@ const compile = (ctx, ast) => {
                     ret += "return (" + compile(ctx, f) + ");\n";
                 else ret += compile(ctx, f) + ";\n";
             }
+            if (ast.forms.length == 0) {
+                ret += "return _NIL_;";
+            }
             ret += "})();\n";
+            return wrapComment(ast, ret);
+        }
+        case "let": {
+            let ret = "";
+            ret += "(()=>{\n";
+            for (let i = 0; i < ast.eqns.length; i++) {
+                const f = ast.eqns[i];
+                ret += compile(ctx, f) + ";\n";
+            }
+            ret += `return (${compile(ctx, ast.exp)}); })()\n`;
             return wrapComment(ast, ret);
         }
         case "do": {
@@ -747,7 +942,35 @@ const compile = (ctx, ast) => {
                     ret += "return (" + compile(ctx, f) + ");\n";
                 else ret += compile(ctx, f) + ";\n";
             }
-            ret += "})();\n";
+            if (ast.exprs.length == 0) {
+                ret += "return _NIL_;";
+            }
+            ret += "})()\n";
+            return wrapComment(ast, ret);
+        }
+        case "vec": {
+            let ret = "[";
+            for (let i = 0; i < ast.vals.length; i++) {
+                ret +=
+                    compile(ctx, ast.vals[i]) +
+                    (i < ast.vals.length - 1 ? "," : "");
+            }
+            ret += "]";
+            return wrapComment(ast, ret);
+        }
+        case "map": {
+            let ret = "({";
+            for (let i = 0; i < ast.pairs.length; i++) {
+                let [key, val] = ast.pairs[i];
+                let keyc = null;
+                if (key.t == "string" || key.t == "id")
+                    keyc = compile(ctx, key);
+                else keyc = `[${compile(ctx, key)}]`;
+                let valc = "";
+                if (val) valc = `:${compile(ctx, val)}`;
+                ret += keyc + valc + (i < ast.pairs.length - 1 ? "," : "");
+            }
+            ret += "})";
             return wrapComment(ast, ret);
         }
         case "eqn": {
@@ -770,7 +993,7 @@ const compile = (ctx, ast) => {
             if (op == "APPLY" || op == "$")
                 return wrapComment(
                     ast,
-                    `RT.V(${compile(ctx, ast.lhs)})(${compile(ctx, ast.rhs)})`
+                    `(${compile(ctx, ast.lhs)})(${compile(ctx, ast.rhs)})`
                 );
 
             if (isJSOp(ctx, op)) {
@@ -785,7 +1008,10 @@ const compile = (ctx, ast) => {
                         );
                     return wrapComment(
                         ast,
-                        `((${compile(ctx, ast.lhs)})[${compile(ctx, ast.rhs)}])`
+                        `RT.F(${compile(ctx, ast.lhs)})(${compile(
+                            ctx,
+                            ast.rhs
+                        )})`
                     );
                 }
                 return wrapComment(
@@ -799,7 +1025,7 @@ const compile = (ctx, ast) => {
 
             return wrapComment(
                 ast,
-                `RT.V(${munge(op)})(${compile(ctx, ast.lhs)})(${compile(
+                `(${munge(op)})(${compile(ctx, ast.lhs)})(${compile(
                     ctx,
                     ast.rhs
                 )})`
@@ -812,7 +1038,7 @@ const compile = (ctx, ast) => {
                     if (ast.op == ".")
                         return wrapComment(
                             ast,
-                            `((${lhs}) => (${rhs}) => ${rhs}[${lhs}])`
+                            `((${lhs}) => (${rhs}) => RT.F(${rhs})(${lhs}))`
                         );
 
                     return wrapComment(
@@ -843,43 +1069,24 @@ const compile = (ctx, ast) => {
         case "string":
             return wrapComment(ast, JSON.stringify(ast.value));
         case "nil":
-            return wrapComment(ast, "null");
+            return wrapComment(ast, "_NIL_");
+        case "lambda":
+            let arg = "";
+            if (ast.arg.t != "nil") arg = compile(ctx, ast.arg);
+            if (ast.arg.t != "map") arg = `(${arg})`;
+            return `(${arg}=>(${compile(ctx, ast.body)}))`;
         default:
             throw new Error("compile error");
     }
 };
 
-class Cell {
-    constructor(value) {
-        this.value = value;
-        this.cmts = [];
-    }
-    withComment(comment) {
-        this.cmts.push(comment);
-        return this;
-    }
-    valueOf() {
-        return this.value;
-    }
-    comments() {
-        return this.cmts;
-    }
-}
-
 const RT = {
-    C(v) {
-        return new Cell(v);
-    },
-    WC(v) {
-        return (c) =>
-            v instanceof Cell ? v.withComment(c) : RT.C(v).withComment(c);
-    },
-    E(v) {
-        return v instanceof Cell ? v.comments() : [];
-    },
-    V(v) {
-        if (v instanceof Cell) return v.valueOf();
-        else return v;
+    F(o) {
+        return (f) => {
+            const v = o[f];
+            if (typeof v == "function") return v.bind(o);
+            else return v;
+        };
     },
     println(x) {
         console.log(x);
@@ -889,26 +1096,155 @@ const RT = {
         return (c) => c.map(f);
     },
     reduce(f) {
-        return (c) => c.reduce(f);
+        return (c) => c.reduce((a, b) => f(a)(b));
     },
+    range(n) {
+        let ret = [];
+        for (let i = 0; i < n; i++) ret.push(i);
+        return ret;
+    },
+    not(x) {
+        return !x;
+    },
+    all_QM_(p) {
+        return (c) => {
+            for (let x of c) {
+                if (!p(x)) return false;
+            }
+            return true;
+        };
+    },
+    curry2: (f) => (x) => (y) => f(x, y),
 };
 
-let inputFile = process.argv[2] || "examples/hello.js";
-let input = fs.readFileSync(inputFile, { encoding: "utf-8" });
+const _NIL_ = null;
 
-const tokens = lexer(lexerRules)(input);
-const context = { optable: ops, tok: tokens };
-const parsed = parseProgram(context, 1);
-//console.log(util.inspect(parsed, { depth: Infinity, colors: true }));
-//console.log("--input:\n", input);
-//console.log("--parsed:\n", debugAST(parsed));
-const compiled = prettier.format(compile(context, parsed), { parser: "babel" });
-//console.log("--compiled:\n", compiled);
-console.log(
-    "\n\nreturned value:\n" +
-        util.inspect(eval(compiled).valueOf(), {
-            colors: true,
+const _PI__GT_ = (lhs) => (rhs) => {
+    return rhs(lhs);
+};
+
+const _AT_ = (f) => (g) => {
+    return (x) => f(g(x));
+};
+
+const globalObj = { RT, _NIL_, _PI__GT_, _AT_ };
+vm.createContext(globalObj);
+
+const evalL = (s) => {
+    return vm.runInContext(s, globalObj);
+};
+
+const compileModule = (context, filename) => {
+    try {
+        const input = fs.readFileSync(filename, { encoding: "utf-8" });
+        const tokens = lexer(lexerRules)(input);
+        const context = { optable: ops, tok: tokens };
+        const parsed = parseProgram(context, 1);
+        const raw = compile(context, parsed);
+        const compiled = prettier.format(raw, { parser: "babel" });
+        return compiled;
+    } catch (e) {
+        console.log(e);
+        return null;
+    }
+};
+
+const repl = () => {
+    console.log("TODO");
+};
+
+const runFile = (f) => {
+    return evalL(compileModule({}, f));
+};
+
+const main = (args) => {
+    const colors = !args["--nocolor"];
+    console.log(args);
+
+    if (args._.length == 0) {
+        repl();
+        return;
+    }
+
+    const command = args._[0];
+
+    let result = null;
+    switch (command) {
+        case "compile":
+        case "c":
+            const f = args._[1];
+            const compiled = compileModule({}, f);
+            let outputFile = path.basename(f, ".iv") + ".js";
+            if (args["--output"] == "-") {
+                outputFile = null;
+            } else if (arg["--output"]) {
+                outputFile = args["--output"];
+            }
+            if (!outputFile) {
+                console.log(compiled);
+            } else fs.writeFileSync(outputFile, compiled);
+            break;
+        case "repl":
+        case "i":
+            result = repl();
+            break;
+        case "run":
+        case "r":
+            result = runFile(args._[1]);
+            break;
+        default:
+            result = runFile(command);
+    }
+
+    if (args["--return"]) {
+        util.inspect(result, {
+            colors: colors,
             depth: Infinity,
-        })
+        });
+    }
+};
+
+main(
+    arg({
+        "--return": Boolean,
+        "-R": "--return",
+
+        "--ast": Boolean,
+        "-A": "--ast",
+
+        "--raw": Boolean,
+        "-P": "--raw",
+
+        "--output": String,
+        "-o": "--output",
+
+        "--nocolor": Boolean,
+    })
 );
-//console.log("input file", inputFile);
+
+// vain file.iv
+// vain run file.iv
+// vain r file.iv
+// --- run file.iv
+
+// vain compile file.iv
+// vain c file.iv
+// --- compile file.iv -> file.js
+
+// vain c file.iv -o foo.js
+// --- compile file.iv -> foo.js
+
+// vain repl
+// vain i
+// --- launch repl
+
+// vain repl file.iv
+// --- launch repl and run file.iv
+
+// console.log(
+//     "returned value:\n" +
+//         util.inspect(evalL(compiled), {
+//             colors: true,
+//             depth: Infinity,
+//         })
+// );

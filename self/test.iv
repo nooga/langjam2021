@@ -1,0 +1,94 @@
+def count a = a.length
+def not = RT.not;
+
+def Success v s = {value: v, rest: s}
+def Fail e s = {error: e, rest: s}
+def Fail? e = e.error != ()
+def Success? = not @ Fail?
+
+def empty? s = s == () || s == "" 
+
+def pval v s = Success v s
+
+def pchar c s 
+    | empty? s   = Fail "no more input" s
+    | c == s . 0 = Success c $ s.slice 1
+    | else       = Fail ("expected `" + c + "` got `" + (s . 0) + "`") s
+    
+def andThen p1 p2 s =
+    let r1 = p1 s 
+    in if Fail? r1 
+       then r1 
+       else let rest = r1.rest 
+                r2 = p2 rest 
+            in if Fail? r2 
+               then r2 
+               else Success [r1.value, r2.value] r2.rest
+
+op >> 20 left
+def (>>) a b = andThen a b
+
+def palt p1 p2 s = 
+    let r1 = p1 s 
+        r2 = p2 s 
+    in if Fail? r1 
+       then r2
+       else r1
+
+op <|> 20 right 
+def (<|>) a b = palt a b  
+
+def pany = RT.reduce (<|>)
+
+def pmaybe p = p <|> pval ()
+
+def zeroOrMore p s = let r = p s 
+                     in if Fail? r
+                        then Success [] s
+                        else let r2 = zeroOrMore p $ r.rest
+                             in Success (r.value.concat [r2.value]) r2.rest
+
+def mapv f p s = let r = p s 
+                 in if Fail? r 
+                    then r
+                    else {value: f r.value, rest: r.rest}  
+
+def oneOrMore p = mapv (v => [v . 0].concat $ v . 1) $ p >> zeroOrMore p
+
+def flat2 = mapv v => v.join ""
+
+def pstring m = RT.reduce (a => b => flat2 $ andThen a b) 
+              $ RT.map pchar 
+              $ m.split ""
+
+def test d f = let p = [] 
+                   expect pred e = p.push $ pred e
+               in do { 
+                   f expect
+                   if RT.all? (== true) p
+                   then RT.println $ "PASS " + d
+                   else RT.println $ "FAIL " + d + " " + (p.join " ")
+                   p
+                }
+
+test "simple parsers" expect => do {
+    expect Fail?    $ pchar "a" "bab"
+    expect Success? $ pchar "b" "bab"
+    expect Fail?    $ (pchar "b" >> pchar "b") "bab"
+    expect Success? $ (pchar "b" >> pchar "a") "bab"
+    expect Success? $ (pchar "b" >> pchar "a" >> pchar "b") "bab"
+    expect Success? $ (pmaybe $ pchar "a") "bab"
+    expect Success? $ (pmaybe $ pchar "a") "aab"
+}
+
+
+
+test "simple grammars" expect => 
+    let aaOrbb = pstring "aa" <|> pstring "bb"
+        g1 = aaOrbb >> aaOrbb  
+    in do {
+        RT.map (expect Success? @ g1) ["aabb", "bbaa", "bbbb", "aaaa"]
+        RT.map (expect Fail? @ g1) ["bbba", "abab", "xxxx", "aaxx"]
+        expect Fail? $ (oneOrMore g1) "bbabbaa"
+        expect Success? $ (oneOrMore g1) "bbaaaabb"
+    }

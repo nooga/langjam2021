@@ -1,0 +1,16 @@
+def bottles n 
+    | n > 1 = do {
+        RT.println $  n + " bottles of beer on the wall.\n" 
+                        + "take one down, pass it around - " + (n - 1) 
+                        + " " + (if n >= 2 then "bottles" else "bottle")
+                        + " on the wall.\n"
+        bottles $ n - 1
+    }
+    | else = do {
+        RT.println $  n + " bottle of beer on the wall.\n"
+                        + "Take one down and pass it around"
+                        + " - no more bottles of beer on the wall.\n"
+        ()
+    }
+
+bottles 100

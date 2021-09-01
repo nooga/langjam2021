@@ -1,0 +1,3 @@
+def x = {z,y} => y + z  + 7
+
+RT.println $ x {z:10, y:10}

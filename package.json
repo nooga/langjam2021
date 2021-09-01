@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "arg": "^5.0.1",
     "mori": "^0.3.2",
     "prettier": "^2.3.2",
     "pretty-print": "^2.0.0"

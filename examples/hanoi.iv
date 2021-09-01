@@ -1,0 +1,8 @@
+def hanoi n from to other 
+    | n == 0 = []
+    | else   = let moveBottom = from + " -> " + to 
+                   toOther    = hanoi (n - 1) from other to
+                   fromOther  = hanoi (n - 1) other to from
+               in (toOther.concat [moveBottom]).concat fromOther
+
+hanoi 4 "A" "B" "C"
