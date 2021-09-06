@@ -1159,7 +1159,6 @@ const runFile = (f) => {
 
 const main = (args) => {
     const colors = !args["--nocolor"];
-    console.log(args);
 
     if (args._.length == 0) {
         repl();
